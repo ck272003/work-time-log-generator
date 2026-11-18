@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+"""
+Work Time Log Generator
+=======================
+Builds a ready-to-use Excel workbook for tracking daily work:
+
+  * Time Log  - one row per task, auto-calculated Log ID, Day, Week, Month and
+                Hours (handles shifts that cross midnight), dropdowns,
+                date/time validation, colour-coded status, yellow highlight for
+                rows with missing start/end times.
+  * Summary   - live tables: hours & entries by category, status, month, week.
+  * Lists     - editable dropdown values.
+  * How to Use - short instructions and colour legend.
+
+Everything in the workbook is a real Excel formula, so it keeps recalculating
+after you edit it. The data below is FICTIONAL sample data.
+
+Usage:
+    python build_work_time_log.py                       # sample data included
+    python build_work_time_log.py --no-sample           # empty log
+    python build_work_time_log.py --owner "Jane Doe" --org "Acme Corp" -o log.xlsx
+"""
+import argparse
+from datetime import date, time
+
+from openpyxl import Workbook
+from openpyxl.formatting.rule import FormulaRule
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.worksheet.datavalidation import DataValidation
+
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
+FIRST_ROW, LAST_ROW = 6, 505          # rows ready for data on 'Time Log'
+FONT = "Arial"
+NAVY = "1F3864"
+BLUE, BLACK = "0000FF", "000000"
+LOG = "'Time Log'"                    # quoted sheet name for formulas
+
+HEADERS = [
+    "Log ID", "Date", "Day", "Week Starting (Mon)", "Month", "Start Time",
+    "End Time", "Hours", "Category", "Work Done / Task", "Team / Person",
+    "Project / Initiative", "Status", "Assigned By", "Source", "Logged At",
+    "Verified", "Remarks",
+]
+WIDTHS = [10, 13, 7, 14, 10, 11, 11, 8, 24, 62, 22, 24, 12, 18, 15, 11, 12, 42]
+
+LISTS = {
+    "Category": [
+        "Meeting", "Planning & Strategy", "Documentation", "Data & Spreadsheets",
+        "Follow-up & Communication", "Coordination", "Research", "Review & QA",
+        "Reporting", "Support", "Learning & Training", "Admin", "Other",
+    ],
+    "Status": ["Completed", "In Progress", "Pending", "On Hold", "Blocked"],
+    "Assigned By": ["Manager", "Team Lead", "Client", "Colleague", "Self"],
+    "Source": ["Chat", "Email", "Spreadsheet", "Meeting", "Self-entered"],
+    "Verified": ["Confirmed", "To confirm"],
+    "Team / Person": ["Team Alpha", "Team Beta", "Team Gamma", "All teams", "Client"],
+}
+
+# Fictional sample rows: (date, start, end, category, task, team, project,
+#                         status, assigned_by, source, logged_at, verified, remarks)
+SAMPLE_START = date(2026, 11, 2)      # a Monday
+SAMPLE = [
+    (date(2026, 11, 2), time(10, 0), time(10, 45), "Meeting", "Weekly team stand-up", "Team Alpha", "Operations", "Completed", "Team Lead", "Meeting", time(10, 50), "Confirmed", ""),
+    (date(2026, 11, 2), time(11, 0), time(13, 30), "Planning & Strategy", "Drafted Q4 project plan and milestones", "Team Alpha", "Q4 Roadmap", "Completed", "Manager", "Email", time(13, 35), "Confirmed", "Sent for review"),
+    (date(2026, 11, 3), time(9, 30), time(11, 0), "Data & Spreadsheets", "Cleaned the customer feedback sheet and removed duplicates", "Team Beta", "Feedback Analysis", "Completed", "Self", "Self-entered", time(11, 5), "Confirmed", ""),
+    (date(2026, 11, 3), time(14, 0), time(16, 15), "Documentation", "Wrote onboarding guide for new joiners", "All teams", "Onboarding", "In Progress", "Manager", "Chat", time(16, 20), "Confirmed", "Needs one more section"),
+    (date(2026, 11, 4), time(10, 0), time(10, 30), "Meeting", "Weekly team stand-up", "Team Alpha", "Operations", "Completed", "Team Lead", "Meeting", time(10, 35), "To confirm", "Confirm duration"),
+    (date(2026, 11, 4), time(12, 0), time(14, 0), "Research", "Compared three scheduling tools for the team", "Team Gamma", "Tooling", "Completed", "Self", "Self-entered", time(14, 5), "Confirmed", "Summary shared"),
+    (date(2026, 11, 5), time(9, 0), time(11, 30), "Review & QA", "Reviewed draft reports and sent feedback", "Team Beta", "Feedback Analysis", "Completed", "Colleague", "Email", time(11, 40), "Confirmed", ""),
+    (date(2026, 11, 5), time(15, 0), None, "Follow-up & Communication", "Followed up with client on pending approvals", "Client", "Q4 Roadmap", "Pending", "Manager", "Email", time(15, 10), "To confirm", "End time still to fill"),
+    (date(2026, 11, 6), time(10, 0), time(10, 30), "Meeting", "Weekly team stand-up", "Team Alpha", "Operations", "Completed", "Team Lead", "Meeting", time(10, 35), "Confirmed", ""),
+    (date(2026, 11, 6), time(13, 0), time(15, 30), "Reporting", "Prepared weekly progress report", "All teams", "Operations", "Completed", "Manager", "Chat", time(15, 40), "Confirmed", ""),
+    (date(2026, 11, 9), time(10, 0), time(12, 0), "Coordination", "Aligned priorities across teams for the week", "All teams", "Operations", "Completed", "Team Lead", "Meeting", time(12, 5), "Confirmed", ""),
+    (date(2026, 11, 9), time(22, 0), time(1, 0), "Support", "Late-night deployment support (crosses midnight)", "Team Gamma", "Tooling", "Completed", "Manager", "Chat", time(1, 5), "Confirmed", "Hours formula handles midnight"),
+    (date(2026, 11, 10), time(9, 30), time(11, 0), "Learning & Training", "Completed online course module", "", "Self-development", "In Progress", "Self", "Self-entered", time(11, 5), "Confirmed", ""),
+    (date(2026, 11, 11), time(11, 0), time(12, 0), "Admin", "Updated timesheets and filed expenses", "", "Admin", "Blocked", "Self", "Self-entered", time(12, 5), "Confirmed", "Waiting on finance approval"),
+]
+
+# --------------------------------------------------------------------------- #
+# Style helpers
+# --------------------------------------------------------------------------- #
+thin = Side(style="thin", color="BFBFBF")
+BORDER = Border(left=thin, right=thin, top=thin, bottom=thin)
+HEADER_FILL = PatternFill("solid", fgColor=NAVY)
+
+
+def f(color=BLACK, bold=False, size=10, italic=False):
+    return Font(name=FONT, color=color, bold=bold, size=size, italic=italic)
+
+
+def header_row(ws, row, col, labels):
+    for i, text in enumerate(labels):
+        c = ws.cell(row=row, column=col + i, value=text)
+        c.font, c.fill, c.border = f("FFFFFF", True), HEADER_FILL, BORDER
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+
+# --------------------------------------------------------------------------- #
+# Sheets
+# --------------------------------------------------------------------------- #
+def build_lists(wb):
+    ws = wb.create_sheet("Lists")
+    cols = ["Category", "Status", "Assigned By", "Source", "Verified", "Team / Person"]
+    header_row(ws, 1, 1, cols)
+    for ci, name in enumerate(cols, start=1):
+        for ri, val in enumerate(LISTS[name], start=2):
+            c = ws.cell(row=ri, column=ci, value=val)
+            c.font = f(BLUE)
+        ws.column_dimensions[ws.cell(row=1, column=ci).column_letter].width = 28 if ci == 1 else 18
+    ws["A17"] = "Edit or add values here to change the dropdowns (stay inside the existing ranges, or extend the validation ranges)."
+    ws["A17"].font = f(italic=True)
+    return ws
+
+
+def build_time_log(wb, owner, org, sample):
+    ws = wb.active
+    ws.title = "Time Log"
+    ws["A1"] = f"Work Time Log - {owner}"
+    ws["A1"].font = f(NAVY, True, 16)
+    ws["A2"] = org
+    ws["A2"].font = f("595959", size=11)
+    ws["A3"] = ("Type in blue columns. Black columns calculate automatically. "
+                "Yellow = Start/End time still to fill. See 'How to Use'.")
+    ws["A3"].font = f("595959", italic=True)
+    header_row(ws, 5, 1, HEADERS)
+    ws.row_dimensions[5].height = 32
+    for i, w in enumerate(WIDTHS, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = w
+    ws.freeze_panes = "D6"
+
+    for r in range(FIRST_ROW, LAST_ROW + 1):
+        formulas = {
+            1: f'=IF(B{r}="","","TL-"&TEXT(ROW()-5,"0000"))',
+            3: f'=IF(B{r}="","",TEXT(B{r},"ddd"))',
+            4: f'=IF(B{r}="","",B{r}-WEEKDAY(B{r},2)+1)',
+            5: f'=IF(B{r}="","",DATE(YEAR(B{r}),MONTH(B{r}),1))',
+            8: f'=IF(AND(ISNUMBER(F{r}),ISNUMBER(G{r})),MOD(G{r}-F{r},1)*24,"")',
+        }
+        for col in range(1, 19):
+            c = ws.cell(row=r, column=col)
+            c.border = BORDER
+            if col in formulas:
+                c.value = formulas[col]
+                c.font = f(BLACK)
+            else:
+                c.font = f(BLUE)
+        ws.cell(row=r, column=2).number_format = "dd/mm/yyyy"
+        ws.cell(row=r, column=4).number_format = "dd/mm/yyyy"
+        ws.cell(row=r, column=5).number_format = "mmm yyyy"
+        ws.cell(row=r, column=6).number_format = "h:mm AM/PM"
+        ws.cell(row=r, column=7).number_format = "h:mm AM/PM"
+        ws.cell(row=r, column=8).number_format = "0.00"
+        ws.cell(row=r, column=16).number_format = "h:mm AM/PM"
+        ws.cell(row=r, column=10).alignment = Alignment(wrap_text=True, vertical="top")
+        ws.cell(row=r, column=18).alignment = Alignment(wrap_text=True, vertical="top")
+
+    if sample:
+        for i, row in enumerate(SAMPLE):
+            r = FIRST_ROW + i
+            d, st, en, cat, task, team, proj, status, by, src, logged, ver, rem = row
+            for col, val in zip((2, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18),
+                                (d, st, en, cat, task, team, proj, status, by, src, logged, ver, rem)):
+                if val not in ("", None):
+                    ws.cell(row=r, column=col, value=val)
+
+    rng = lambda col: f"{col}{FIRST_ROW}:{col}{LAST_ROW}"
+
+    # --- dropdowns -------------------------------------------------------- #
+    def dropdown(col, src, strict=True):
+        dv = DataValidation(type="list", formula1=src, allow_blank=True,
+                            showErrorMessage=strict)
+        ws.add_data_validation(dv)
+        dv.add(rng(col))
+
+    dropdown("I", f"=Lists!$A$2:$A${1 + len(LISTS['Category'])}")
+    dropdown("M", f"=Lists!$B$2:$B${1 + len(LISTS['Status'])}")
+    dropdown("N", f"=Lists!$C$2:$C${1 + len(LISTS['Assigned By'])}")
+    dropdown("O", f"=Lists!$D$2:$D${1 + len(LISTS['Source'])}")
+    dropdown("Q", f"=Lists!$E$2:$E${1 + len(LISTS['Verified'])}")
+    dropdown("K", f"=Lists!$F$2:$F${1 + len(LISTS['Team / Person'])}", strict=False)  # suggests, accepts any text
+
+    # --- date / time validation ------------------------------------------ #
+    dv_date = DataValidation(type="date", operator="greaterThanOrEqual",
+                             formula1="Summary!$C$7", allow_blank=True,
+                             errorTitle="Invalid date",
+                             error="Enter a valid date on/after the tracking start date (Summary!C7).")
+    ws.add_data_validation(dv_date)
+    dv_date.add(rng("B"))
+
+    dv_time = DataValidation(type="decimal", operator="between", formula1="0",
+                             formula2="0.999988", allow_blank=True,
+                             errorTitle="Invalid time", error="Enter a time such as 10:00 AM or 14:30.")
+    ws.add_data_validation(dv_time)
+    dv_time.add(f"F{FIRST_ROW}:G{LAST_ROW}")
+
+    # --- conditional formatting ------------------------------------------ #
+    r0 = FIRST_ROW
+    ws.conditional_formatting.add(
+        f"F{r0}:G{LAST_ROW}",
+        FormulaRule(formula=[f'AND($B{r0}<>"",F{r0}="")'],
+                    fill=PatternFill("solid", bgColor="FFFF00")))
+    green = PatternFill("solid", bgColor="C6EFCE")
+    amber = PatternFill("solid", bgColor="FFEB9C")
+    red = PatternFill("solid", bgColor="FFC7CE")
+    ws.conditional_formatting.add(rng("M"), FormulaRule(formula=[f'M{r0}="Completed"'], fill=green))
+    ws.conditional_formatting.add(rng("M"), FormulaRule(formula=[f'OR(M{r0}="In Progress",M{r0}="Pending")'], fill=amber))
+    ws.conditional_formatting.add(rng("M"), FormulaRule(formula=[f'OR(M{r0}="Blocked",M{r0}="On Hold")'], fill=red))
+    ws.conditional_formatting.add(rng("Q"), FormulaRule(formula=[f'Q{r0}="To confirm"'], fill=amber))
+    ws.auto_filter.ref = f"A5:R{LAST_ROW}"
+    return ws
+
+
+def build_summary(wb, start_date):
+    ws = wb.create_sheet("Summary")
+    ws["B2"] = "Summary - updates automatically from 'Time Log'"
+    ws["B2"].font = f(NAVY, True, 16)
+
+    ws["B4"] = "Settings"
+    ws["B4"].font = f(NAVY, True, 12)
+    ws["B7"] = "Tracking start date"
+    ws["B7"].font = f(bold=True)
+    ws["C7"] = start_date
+    ws["C7"].font, ws["C7"].number_format = f(BLUE, True), "dd/mm/yyyy"
+    ws["C7"].fill = PatternFill("solid", fgColor="FFFF00")
+    ws["D7"] = "Input - drives the weekly and monthly tables and the date validation on 'Time Log'."
+    ws["D7"].font = f(italic=True, color="595959")
+
+    # Overview
+    ws["B9"] = "Overview"
+    ws["B9"].font = f(NAVY, True, 12)
+    overview = [
+        ("Total entries", f"=COUNT({LOG}!$B${FIRST_ROW}:$B${LAST_ROW})", "0"),
+        ("Total hours", f"=SUM({LOG}!$H${FIRST_ROW}:$H${LAST_ROW})", "0.00"),
+        ("Entries missing start/end time",
+         f'=SUMPRODUCT(({LOG}!$B${FIRST_ROW}:$B${LAST_ROW}<>"")*({LOG}!$H${FIRST_ROW}:$H${LAST_ROW}=""))', "0"),
+    ]
+    for i, (label, formula, fmt) in enumerate(overview):
+        r = 10 + i
+        ws.cell(row=r, column=2, value=label).font = f(bold=True)
+        c = ws.cell(row=r, column=3, value=formula)
+        c.font, c.number_format, c.alignment = f(), fmt, Alignment(horizontal="right")
+    # C10 entries, C11 hours, C12 missing
+
+    TL = lambda col: f"{LOG}!${col}${FIRST_ROW}:${col}${LAST_ROW}"
+
+    def table(top, left, title, labels, label_formulas, key_col, label_fmt=None, total_ref="$C$11"):
+        ws.cell(row=top - 1, column=left, value=title).font = f(NAVY, True, 12)
+        header_row(ws, top, left, [labels, "Entries", "Hours", "% of hours"])
+        for i, lf in enumerate(label_formulas):
+            r = top + 1 + i
+            lab, ent, hrs, pct = (ws.cell(row=r, column=left + k) for k in range(4))
+            L = lab.coordinate
+            lab.value = lf(i)
+            ent.value = f'=IF({L}="","",COUNTIFS({TL(key_col)},{L}))'
+            hrs.value = f'=IF({L}="","",SUMIFS({TL("H")},{TL(key_col)},{L}))'
+            pct.value = f'=IF(OR({L}="",{total_ref}=0),"",{hrs.coordinate}/{total_ref})'
+            for c in (lab, ent, hrs, pct):
+                c.font, c.border = f(), BORDER
+            ent.number_format, hrs.number_format, pct.number_format = "0", "0.00", "0.0%"
+            if label_fmt:
+                lab.number_format = label_fmt
+                lab.alignment = Alignment(horizontal="left")
+
+    n_cat, n_stat = len(LISTS["Category"]), len(LISTS["Status"])
+    table(15, 2, "Hours by category", "Category",
+          [lambda i, n=i: f'=IF(Lists!A{n + 2}="","",Lists!A{n + 2})' for i in range(n_cat)], "I")
+    table(15, 7, "Hours by status", "Status",
+          [lambda i, n=i: f'=IF(Lists!B{n + 2}="","",Lists!B{n + 2})' for i in range(n_stat)], "M")
+
+    # Monthly: 12 months from the start date
+    month_top = 15 + n_cat + 4
+    table(month_top, 2, "Hours by month", "Month",
+          [(lambda i: "=DATE(YEAR($C$7),MONTH($C$7),1)") if i == 0 else
+           (lambda i, n=i: f"=EDATE(B{month_top + n},1)") for i in range(12)],
+          "E", label_fmt="mmm yyyy")
+    # Weekly: 26 weeks from the Monday of the start date
+    week_top = 15 + n_stat + 4
+    table(week_top, 7, "Hours by week (week starting Monday)", "Week starting",
+          [(lambda i: "=$C$7-WEEKDAY($C$7,2)+1") if i == 0 else
+           (lambda i, n=i: f"=G{week_top + n}+7") for i in range(26)],
+          "D", label_fmt="dd/mm/yyyy")
+
+    for col, w in zip("ABCDEFGHIJ", (3, 30, 12, 12, 12, 4, 18, 10, 10, 12)):
+        ws.column_dimensions[col].width = w
+    ws.sheet_view.showGridLines = False
+    return ws
+
+
+def build_how_to(wb, owner, org):
+    ws = wb.create_sheet("How to Use", 0)
+    ws["B1"] = "Work Time Log - How to Use"
+    ws["B1"].font = f(NAVY, True, 16)
+    ws["B2"] = f"{owner} | {org}"
+    ws["B2"].font = f("595959", size=11)
+    rows = [
+        ("Daily use", None),
+        ("1. Add a row", f"Go to 'Time Log' and type in the next empty row (rows {FIRST_ROW} to {LAST_ROW} are ready). Date, Category, Work Done and Status are the main fields."),
+        ("2. Enter times", "Fill Start Time and End Time (e.g. 10:00 AM, 11:30 AM). Hours calculates itself, including work that crosses midnight."),
+        ("3. Use the dropdowns", "Category, Status, Assigned By, Source and Verified use the lists on 'Lists'. Team / Person suggests names from 'Lists' but accepts any text."),
+        ("4. One row per task", "If a task runs over several days or sessions, add a row for each so hours land on the correct day."),
+        ("5. Check the Summary", "'Summary' updates automatically: hours and entries by category, status, month and week."),
+        ("Colour legend", None),
+        ("Blue text", "Cells you type in (inputs)."),
+        ("Black text", "Formulas - do not overwrite (Log ID, Day, Week Starting, Month, Hours)."),
+        ("Yellow cell", "A logged row with a blank Start or End time - it turns white once filled."),
+        ("Example row (not counted in the log)", None),
+        ("Format", "Date 05/11/2026 | Start 9:00 AM | End 11:30 AM | Hours 2.50 (auto) | Category: Review & QA | Work Done: Reviewed draft reports and sent feedback | Status: Completed | Assigned By: Colleague | Source: Email | Verified: Confirmed"),
+        ("Sample data", "'Time Log' starts with FICTIONAL sample rows so you can see how it works. Delete rows 6 onward (columns B, F:G, I:R only - keep the formulas in A, C, D, E, H) before real use."),
+    ]
+    r = 4
+    for label, text in rows:
+        a = ws.cell(row=r, column=2, value=label)
+        if text is None:
+            a.font = f(NAVY, True, 12)
+        else:
+            a.font = f(bold=True)
+            b = ws.cell(row=r, column=3, value=text)
+            b.font, b.alignment = f(), Alignment(wrap_text=True, vertical="top")
+        r += 1
+    ws["B11"].font = f(BLUE, True)
+    ws["B12"].font = f(BLACK, True)
+    ws["B13"].fill = PatternFill("solid", fgColor="FFFF00")
+    ws.column_dimensions["A"].width = 3
+    ws.column_dimensions["B"].width = 34
+    ws.column_dimensions["C"].width = 95
+    ws.sheet_view.showGridLines = False
+    return ws
+
+
+# --------------------------------------------------------------------------- #
+def main():
+    p = argparse.ArgumentParser(description="Generate an Excel work-time-log workbook.")
+    p.add_argument("-o", "--output", default="Work_Time_Log.xlsx")
+    p.add_argument("--owner", default="Your Name")
+    p.add_argument("--org", default="Your Company | Your Team")
+    p.add_argument("--start-date", default=None, help="Tracking start date, YYYY-MM-DD")
+    p.add_argument("--no-sample", action="store_true", help="Leave the log empty")
+    a = p.parse_args()
+
+    start = date.fromisoformat(a.start_date) if a.start_date else (
+        date.today() if a.no_sample else SAMPLE_START)
+
+    wb = Workbook()
+    build_time_log(wb, a.owner, a.org, sample=not a.no_sample)
+    build_summary(wb, start)
+    build_lists(wb)
+    build_how_to(wb, a.owner, a.org)
+    wb._sheets = [wb["How to Use"], wb["Time Log"], wb["Summary"], wb["Lists"]]
+    wb.active = 1
+    wb.save(a.output)
+    print(f"Saved {a.output}")
+
+
+if __name__ == "__main__":
+    main()
