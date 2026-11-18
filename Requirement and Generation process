@@ -1,0 +1,10 @@
+Requirements 
+openpyxl>=3.1
+
+gitignore · GITIGNORE
+# Never commit real work logs - they may contain confidential names and details
+*.xlsx
+!Work_Time_Log_Sample.xlsx
+~$*.xlsx
+__pycache__/
+.venv/
